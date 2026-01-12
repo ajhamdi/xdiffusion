@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 scripts/scheckpoints/
 data/
+output/
 
 # C extensions
 *.so
