@@ -609,7 +609,9 @@ def main(
     generate_denoised=True,
     generate_reconstruction=False,
     use_median=False,
-    axis='axial'
+    axis='axial',
+    num_workers=1,
+    total_view=1
 ):
     """
     Main inference function
@@ -630,6 +632,8 @@ def main(
         generate_reconstruction: Whether to generate encode-decode reconstruction
         use_median: Use evenly-spaced median slices instead of random sampling
         axis: Anatomical axis for slicing ('axial', 'sagittal', 'coronal', or 'random')
+        num_workers: Number of dataloader workers
+        total_view: Number of conditioning slices for multi-slice conditioning
     """
     
     # Setup device
@@ -662,8 +666,6 @@ def main(
         }
     }
 
-    # Read total_view from config file, default to 1 if not specified
-    total_view = config_obj.data.get('total_view', 1)
     print(f"Using total_view={total_view} for multi-slice conditioning")
     
     # Use median slices if specified
@@ -684,7 +686,7 @@ def main(
         batch_size=batch_size, 
         total_view=total_view,
         test=test_config, 
-        num_workers=1,
+        num_workers=num_workers,
         use_median=use_median,
         axis=axis_param
     )
@@ -748,6 +750,19 @@ def main(
     return volumes
 
 
+def get_config_value(config_obj, *keys, default=None):
+    """Safely get a nested value from OmegaConf config object."""
+    obj = config_obj
+    for key in keys:
+        if hasattr(obj, key):
+            obj = getattr(obj, key)
+        elif isinstance(obj, dict) and key in obj:
+            obj = obj[key]
+        else:
+            return default
+    return obj if obj is not None else default
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='BraTS Diffusion Model Inference - Generate 3D Volumes')
     
@@ -766,12 +781,17 @@ if __name__ == "__main__":
                         help='Directory to save outputs')
     parser.add_argument('--batch_size', type=int, default=1,
                         help='Batch size (default: 1)')
+    parser.add_argument('--num_workers', type=int, default=None,
+                        help='Number of dataloader workers (default: from config or 1)')
+    parser.add_argument('--total_view', type=int, default=None,
+                        help='Number of conditioning slices for multi-slice conditioning '
+                             '(default: from config or 1)')
     
-    # Sampling arguments
+    # Sampling arguments - use None to allow config override
     parser.add_argument('--ddim_steps', type=int, default=50,
                         help='Number of denoising steps (default: 50, range: 25-200)')
-    parser.add_argument('--guidance_scale', type=float, default=7.5,
-                        help='Classifier-free guidance scale (default: 7.5, range: 3.0-15.0)')
+    parser.add_argument('--guidance_scale', type=float, default=None,
+                        help='Classifier-free guidance scale (default: from config or 3.0)')
     parser.add_argument('--ddim_eta', type=float, default=0.0,
                         help='Stochasticity in sampling, 0=deterministic (default: 0.0)')
     parser.add_argument('--image_size', type=int, default=256,
@@ -805,6 +825,77 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
+    # Load config to get default values
+    config_path = args.config
+    if not os.path.exists(config_path) and not os.path.isabs(config_path):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(script_dir, config_path)
+    
+    if os.path.exists(config_path):
+        config_obj = OmegaConf.load(config_path)
+        print(f"Loaded config from: {config_path}")
+        
+        # Apply config defaults for values not specified via CLI
+        if args.data_path is None:
+            args.data_path = get_config_value(config_obj, 'data', 'root_dir', 
+                                              default='./ASNR-MICCAI-BraTS2023-GLI/')
+            print(f"  Using data_path from config: {args.data_path}")
+        
+        if args.batch_size is None:
+            args.batch_size = get_config_value(config_obj, 'data', 'batch_size', default=1)
+            print(f"  Using batch_size from config: {args.batch_size}")
+        
+        if args.num_workers is None:
+            args.num_workers = get_config_value(config_obj, 'data', 'num_workers', default=1)
+            print(f"  Using num_workers from config: {args.num_workers}")
+        
+        if args.total_view is None:
+            args.total_view = get_config_value(config_obj, 'data', 'total_view', default=1)
+            print(f"  Using total_view from config: {args.total_view}")
+        
+        if args.image_size is None:
+            # Try to get from train, validation, or test image_transforms
+            args.image_size = get_config_value(config_obj, 'data', 'train', 'image_transforms', 'size',
+                                               default=None)
+            if args.image_size is None:
+                args.image_size = get_config_value(config_obj, 'data', 'validation', 'image_transforms', 'size',
+                                                   default=None)
+            if args.image_size is None:
+                args.image_size = get_config_value(config_obj, 'data', 'test', 'image_transforms', 'size',
+                                                   default=256)
+            print(f"  Using image_size from config: {args.image_size}")
+        
+        if args.guidance_scale is None:
+            # Get from lightning.callbacks.image_logger.params.log_images_kwargs.unconditional_guidance_scale
+            args.guidance_scale = get_config_value(config_obj, 'lightning', 'callbacks', 'image_logger', 
+                                                   'params', 'log_images_kwargs', 'unconditional_guidance_scale',
+                                                   default=3.0)
+            print(f"  Using guidance_scale from config: {args.guidance_scale}")
+    else:
+        print(f"Warning: Config file not found at {config_path}, using hardcoded defaults")
+        # Set hardcoded defaults if config not found
+        if args.data_path is None:
+            args.data_path = './ASNR-MICCAI-BraTS2023-GLI/'
+        if args.batch_size is None:
+            args.batch_size = 1
+        if args.num_workers is None:
+            args.num_workers = 1
+        if args.total_view is None:
+            args.total_view = 1
+        if args.image_size is None:
+            args.image_size = 256
+        if args.guidance_scale is None:
+            args.guidance_scale = 3.0
+    
+    print(f"\nFinal configuration:")
+    print(f"  data_path: {args.data_path}")
+    print(f"  batch_size: {args.batch_size}")
+    print(f"  num_workers: {args.num_workers}")
+    print(f"  total_view: {args.total_view}")
+    print(f"  image_size: {args.image_size}")
+    print(f"  guidance_scale: {args.guidance_scale}")
+    print()
+    
     # Call main function with parsed arguments
     volumes = main(
         device_idx=args.device_idx,
@@ -821,6 +912,8 @@ if __name__ == "__main__":
         generate_denoised=args.generate_denoised,
         generate_reconstruction=args.generate_reconstruction,
         use_median=args.median,
-        axis=args.axis
+        axis=args.axis,
+        num_workers=args.num_workers,
+        total_view=args.total_view
     )
     
