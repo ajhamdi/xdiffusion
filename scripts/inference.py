@@ -5,16 +5,295 @@ import torch
 from einops import rearrange
 from ldm.models.diffusion.ddim import DDIMSampler
 from omegaconf import OmegaConf
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torch import autocast
 from ldm.util import instantiate_from_config
 import os 
 import nibabel as nib
-from ldm.data.bratsloader import BratsDatasetModuleFromConfig
+from ldm.data.bratsloader import BratsDatasetModuleFromConfig, BratsSingleVolumeDataset
 from tqdm import tqdm
 import argparse
 import json
 import ldm.modules.diffusionmodules.openaimodel as openai_module
+import torchvision
+from torchvision import transforms
+import random
+import glob
+import math
+from torch.utils.data import DataLoader
+
+
+def create_comparison_gif(target_slices, denoised_slices, output_path, fps=5, image_size=256):
+    """
+    Create a GIF showing target and denoised slices side by side with labels.
+    
+    Args:
+        target_slices: List of target slice tensors/arrays
+        denoised_slices: List of denoised slice tensors/arrays
+        output_path: Path to save the GIF
+        fps: Frames per second
+        image_size: Size of each image panel
+    """
+    frames = []
+    label_height = 30
+    
+    for idx, (target, denoised) in enumerate(zip(target_slices, denoised_slices)):
+        # Convert tensors to numpy arrays if needed
+        if torch.is_tensor(target):
+            target = target.cpu().numpy()
+        if torch.is_tensor(denoised):
+            denoised = denoised.cpu().numpy()
+        
+        # Handle different tensor formats
+        # Target might be [H, W, C] or [C, H, W]
+        if target.shape[0] in [1, 3] and len(target.shape) == 3:
+            target = np.transpose(target, (1, 2, 0))
+        if denoised.shape[0] in [1, 3] and len(denoised.shape) == 3:
+            denoised = np.transpose(denoised, (1, 2, 0))
+        
+        # Normalize to [0, 255]
+        if target.max() <= 1.0:
+            target = (target * 255).astype(np.uint8)
+        else:
+            target = target.astype(np.uint8)
+        if denoised.max() <= 1.0:
+            denoised = (denoised * 255).astype(np.uint8)
+        else:
+            denoised = denoised.astype(np.uint8)
+        
+        # Take first channel if 3-channel grayscale
+        if len(target.shape) == 3 and target.shape[-1] == 3:
+            target = target[:, :, 0]
+        if len(denoised.shape) == 3 and denoised.shape[-1] == 3:
+            denoised = denoised[:, :, 0]
+        
+        # Resize if needed
+        if target.shape[0] != image_size or target.shape[1] != image_size:
+            target_img = Image.fromarray(target).resize((image_size, image_size))
+            target = np.array(target_img)
+        if denoised.shape[0] != image_size or denoised.shape[1] != image_size:
+            denoised_img = Image.fromarray(denoised).resize((image_size, image_size))
+            denoised = np.array(denoised_img)
+        
+        # Create combined frame with labels
+        frame_width = image_size * 2 + 10  # 10 pixels gap
+        frame_height = image_size + label_height
+        frame = Image.new('RGB', (frame_width, frame_height), color=(30, 30, 30))
+        draw = ImageDraw.Draw(frame)
+        
+        # Try to use a better font, fall back to default
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+        except:
+            font = ImageFont.load_default()
+        
+        # Add labels
+        target_label = f"Target (Slice {idx+1}/{len(target_slices)})"
+        denoised_label = f"Denoised (Slice {idx+1}/{len(denoised_slices)})"
+        
+        draw.text((image_size//2 - 60, 5), target_label, fill=(255, 255, 255), font=font)
+        draw.text((image_size + 10 + image_size//2 - 60, 5), denoised_label, fill=(100, 255, 100), font=font)
+        
+        # Add images
+        target_pil = Image.fromarray(target).convert('RGB')
+        denoised_pil = Image.fromarray(denoised).convert('RGB')
+        
+        frame.paste(target_pil, (0, label_height))
+        frame.paste(denoised_pil, (image_size + 10, label_height))
+        
+        frames.append(frame)
+    
+    # Save as GIF
+    if frames:
+        duration = int(1000 / fps)  # Convert fps to milliseconds per frame
+        frames[0].save(
+            output_path,
+            save_all=True,
+            append_images=frames[1:],
+            duration=duration,
+            loop=0
+        )
+        print(f"GIF saved to: {output_path}")
+        print(f"  - {len(frames)} frames")
+        print(f"  - {fps} fps")
+        print(f"  - Duration: {len(frames) / fps:.1f} seconds")
+
+
+def process_single_sample(sample_idx, model, sampler, dataset_module, output_dir,
+                          h=256, w=256, ddim_steps=50, scale=7.5,
+                          ddim_eta=0.0, device='cuda:0', total_view=1,
+                          use_median=False, axis='axial', image_transforms=None,
+                          fps=5, save_individual_slices=True):
+    """
+    Process a single 3D sample, generating all slices and creating a comparison GIF.
+    
+    Args:
+        sample_idx: Index of the 3D sample in the dataset
+        model: Diffusion model
+        sampler: DDIM sampler
+        dataset_module: BratsDatasetModuleFromConfig instance (for getting paths)
+        output_dir: Directory to save outputs
+        h, w: Image height and width
+        ddim_steps: Number of denoising steps
+        scale: Guidance scale
+        ddim_eta: DDIM eta
+        device: Device to use
+        total_view: Number of conditioning slices
+        use_median: Use median slice selection
+        axis: Anatomical axis
+        image_transforms: Image transforms to apply
+        fps: Frames per second for the GIF
+        save_individual_slices: Whether to save individual PNG slices
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Get all available nifti paths
+    all_paths = dataset_module.train_paths + dataset_module.val_paths
+    
+    if sample_idx < 0 or sample_idx >= len(all_paths):
+        raise ValueError(f"Sample index {sample_idx} out of range. Dataset has {len(all_paths)} samples (0-{len(all_paths)-1})")
+    
+    nifti_path = all_paths[sample_idx]
+    print(f"\nProcessing sample {sample_idx}: {nifti_path}")
+    
+    # Create dataset for this single volume
+    single_volume_dataset = BratsSingleVolumeDataset(
+        nifti_path=nifti_path,
+        image_transforms=image_transforms,
+        total_view=total_view,
+        use_median=use_median,
+        axis=axis
+    )
+    
+    # Create dataloader
+    dataloader = DataLoader(single_volume_dataset, batch_size=1, shuffle=False, num_workers=0)
+    
+    # Storage for slices
+    target_slices = []
+    denoised_slices = []
+    psnr_values = []
+    ssim_values = []
+    slice_metrics = []
+    
+    patient_name = single_volume_dataset.patient_id
+    
+    print(f"\nStarting inference on {len(single_volume_dataset)} slices...")
+    
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Processing {patient_name}")):
+        target = batch["image_target"]
+        input_im = batch["image_cond"]
+        T_cond = batch['T']
+        slice_idx = batch['slice_idx'].item()
+        
+        # Move to device
+        input_im = input_im.to(device)
+        target = target.to(device)
+        T_cond = T_cond.to(device)
+        
+        # Normalize target to [0, 1] range
+        target_normalized = torch.clamp((target + 1.0) / 2.0, min=0.0, max=1.0)
+        target_normalized_chw = rearrange(target_normalized, 'b h w c -> b c h w')
+        
+        # Generate denoised output
+        denoised_output = sample_slice_with_denoising(
+            input_im, T_cond, model, sampler,
+            h, w, ddim_steps, n_samples=1,
+            scale=scale, ddim_eta=ddim_eta, device=device
+        )
+        
+        # Calculate metrics
+        slice_psnr = calculate_psnr(denoised_output, target_normalized_chw, data_range=1.0)
+        slice_ssim = calculate_ssim(denoised_output, target_normalized_chw, data_range=1.0)
+        
+        psnr_values.append(slice_psnr)
+        ssim_values.append(slice_ssim)
+        slice_metrics.append({
+            'slice_idx': slice_idx,
+            'psnr': slice_psnr,
+            'ssim': slice_ssim
+        })
+        
+        # Store slices for GIF
+        target_slices.append(target_normalized_chw[0].cpu())
+        denoised_slices.append(denoised_output[0].cpu())
+        
+        # Save individual PNG slices
+        if save_individual_slices:
+            slice_filename = f"{patient_name}_slice_{slice_idx:03d}"
+            
+            # Save denoised slice
+            denoised_dir = os.path.join(output_dir, 'slices_denoised')
+            os.makedirs(denoised_dir, exist_ok=True)
+            save_slice_as_png(denoised_output[0], os.path.join(denoised_dir, f"{slice_filename}_denoised.png"))
+            
+            # Save target slice
+            target_dir = os.path.join(output_dir, 'slices_target')
+            os.makedirs(target_dir, exist_ok=True)
+            save_slice_as_png(target_normalized_chw[0], os.path.join(target_dir, f"{slice_filename}_target.png"))
+            
+            # Save input/conditioning slice (same for all slices in single sample mode)
+            input_dir = os.path.join(output_dir, 'slices_input')
+            os.makedirs(input_dir, exist_ok=True)
+            input_normalized = torch.clamp((input_im + 1.0) / 2.0, min=0.0, max=1.0)
+            input_normalized_chw = rearrange(input_normalized, 'b h w c -> b c h w')
+            save_slice_as_png(input_normalized_chw[0], os.path.join(input_dir, f"{slice_filename}_input.png"))
+    
+    # Create comparison GIF
+    gif_path = os.path.join(output_dir, f'{patient_name}_comparison.gif')
+    create_comparison_gif(target_slices, denoised_slices, gif_path, fps=fps, image_size=h)
+    
+    # Calculate and display metrics summary
+    avg_psnr = np.mean(psnr_values)
+    std_psnr = np.std(psnr_values)
+    avg_ssim = np.mean(ssim_values)
+    std_ssim = np.std(ssim_values)
+    
+    print("\n" + "="*60)
+    print("QUALITY METRICS SUMMARY")
+    print("="*60)
+    print(f"Patient: {patient_name}")
+    print(f"Sample Index: {sample_idx}")
+    print(f"Number of slices: {len(psnr_values)}")
+    print("-"*60)
+    print(f"PSNR (dB): Mean={avg_psnr:.4f}, Std={std_psnr:.4f}")
+    print(f"SSIM:      Mean={avg_ssim:.4f}, Std={std_ssim:.4f}")
+    print("="*60)
+    
+    # Save metrics
+    metrics_summary = {
+        'patient': patient_name,
+        'sample_idx': sample_idx,
+        'nifti_path': nifti_path,
+        'axis': axis,
+        'total_view': total_view,
+        'use_median': use_median,
+        'num_slices': len(psnr_values),
+        'conditioning_indices': single_volume_dataset.cond_indices,
+        'psnr': {
+            'mean': float(avg_psnr),
+            'std': float(std_psnr),
+            'min': float(np.min(psnr_values)),
+            'max': float(np.max(psnr_values))
+        },
+        'ssim': {
+            'mean': float(avg_ssim),
+            'std': float(std_ssim),
+            'min': float(np.min(ssim_values)),
+            'max': float(np.max(ssim_values))
+        },
+        'per_slice': slice_metrics
+    }
+    
+    metrics_path = os.path.join(output_dir, f'{patient_name}_metrics.json')
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics_summary, f, indent=2)
+    print(f"Metrics saved to: {metrics_path}")
+    
+    return {
+        'patient': patient_name,
+        'gif_path': gif_path,
+        'metrics': metrics_summary
+    }
 
 
 def calculate_psnr(pred, target, data_range=1.0):
@@ -611,7 +890,9 @@ def main(
     use_median=False,
     axis='axial',
     num_workers=1,
-    total_view=1
+    total_view=1,
+    one_sample=None,
+    gif_fps=5
 ):
     """
     Main inference function
@@ -634,6 +915,8 @@ def main(
         axis: Anatomical axis for slicing ('axial', 'sagittal', 'coronal', or 'random')
         num_workers: Number of dataloader workers
         total_view: Number of conditioning slices for multi-slice conditioning
+        one_sample: If specified, process only this 3D sample index and generate a GIF
+        gif_fps: Frames per second for the output GIF (when using --one_sample)
     """
     
     # Setup device
@@ -691,11 +974,76 @@ def main(
         axis=axis_param
     )
 
+    # Setup sampler
+    sampler = DDIMSampler(model)
+    
+    # ========== ONE SAMPLE MODE ==========
+    if one_sample is not None:
+        print(f"\n{'='*60}")
+        print(f"ONE SAMPLE MODE: Processing sample #{one_sample}")
+        print(f"{'='*60}")
+        
+        # Create image transforms for single sample mode
+        img_transforms = [torchvision.transforms.Resize((image_size, image_size))]
+        img_transforms.extend([
+            transforms.ToTensor(),
+            transforms.Lambda(lambda x: rearrange(x * 2. - 1., 'c h w -> h w c'))
+        ])
+        image_transforms = torchvision.transforms.Compose(img_transforms)
+        
+        # Apply model device fix
+        original_apply_model = model.apply_model
+        
+        def apply_model_with_device_fix(x_noisy, t, cond):
+            model_device = x_noisy.device
+            if torch.is_tensor(t):
+                t = t.to(model_device)
+            if isinstance(cond, dict):
+                fixed_cond = {}
+                for key, value in cond.items():
+                    if isinstance(value, list):
+                        fixed_cond[key] = [v.to(model_device) if torch.is_tensor(v) else v for v in value]
+                    elif torch.is_tensor(value):
+                        fixed_cond[key] = value.to(model_device)
+                    else:
+                        fixed_cond[key] = value
+            else:
+                fixed_cond = cond
+            return original_apply_model(x_noisy, t, fixed_cond)
+        
+        model.apply_model = apply_model_with_device_fix
+        
+        result = process_single_sample(
+            sample_idx=one_sample,
+            model=model,
+            sampler=sampler,
+            dataset_module=dataset,
+            output_dir=output_dir,
+            h=image_size,
+            w=image_size,
+            ddim_steps=ddim_steps,
+            scale=guidance_scale,
+            ddim_eta=ddim_eta,
+            device=device,
+            total_view=total_view,
+            use_median=use_median,
+            axis=axis if axis != 'random' else 'axial',  # Default to axial for single sample
+            image_transforms=image_transforms,
+            fps=gif_fps,
+            save_individual_slices=save_individual_slices
+        )
+        
+        print(f"\n{'='*60}")
+        print(f"Single sample processing complete!")
+        print(f"Output GIF: {result['gif_path']}")
+        print(f"{'='*60}")
+        
+        return result
+
+    # ========== NORMAL FULL DATASET MODE ==========
     dataset.test_paths = dataset.train_paths + dataset.val_paths  # Use all data for inference
 
     dataloader = dataset.test_dataloader()
-    # Setup sampler
-    sampler = DDIMSampler(model)
 
     #To ensure device consistency
     original_apply_model = model.apply_model
@@ -823,6 +1171,15 @@ if __name__ == "__main__":
                              'axial=z-axis/transverse, sagittal=x-axis, coronal=y-axis, '
                              'random=randomly select axis per sample')
     
+    # Single sample mode arguments
+    parser.add_argument('--one_sample', type=int, default=None,
+                        help='Process only one 3D sample (by index) and generate a comparison GIF. '
+                             'All slices in the volume will be processed sequentially. '
+                             'Output will be a GIF showing target and denoised slices side by side.')
+    parser.add_argument('--gif_fps', type=int, default=5,
+                        help='Frames per second for the output GIF (default: 5). '
+                             'Only used with --one_sample.')
+    
     args = parser.parse_args()
     
     # Load config to get default values
@@ -914,6 +1271,8 @@ if __name__ == "__main__":
         use_median=args.median,
         axis=args.axis,
         num_workers=args.num_workers,
-        total_view=args.total_view
+        total_view=args.total_view,
+        one_sample=args.one_sample,
+        gif_fps=args.gif_fps
     )
     
