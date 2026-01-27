@@ -426,6 +426,55 @@ def smooth_intensity_profile(volume, sigma=2.0):
     return result
 
 
+def save_volume_pngs(volume, output_dir, prefix, num_slices=9):
+    """Save PNG images of volume slices.
+    
+    Args:
+        volume: 3D numpy array (H, W, D)
+        output_dir: Directory to save images
+        prefix: Filename prefix
+        num_slices: Number of slices to save in the montage
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    n_slices = volume.shape[2]
+    
+    # Normalize volume to 0-255
+    vol_min, vol_max = volume.min(), volume.max()
+    if vol_max - vol_min > 1e-8:
+        vol_norm = ((volume - vol_min) / (vol_max - vol_min) * 255).astype(np.uint8)
+    else:
+        vol_norm = np.zeros_like(volume, dtype=np.uint8)
+    
+    # Save individual slices at key positions
+    slice_indices = np.linspace(0, n_slices - 1, num_slices, dtype=int)
+    
+    # Create montage image
+    n_cols = 3
+    n_rows = (num_slices + n_cols - 1) // n_cols
+    h, w = volume.shape[:2]
+    montage = np.zeros((n_rows * h, n_cols * w), dtype=np.uint8)
+    
+    for i, slice_idx in enumerate(slice_indices):
+        row, col = i // n_cols, i % n_cols
+        montage[row*h:(row+1)*h, col*w:(col+1)*w] = vol_norm[:, :, slice_idx]
+    
+    # Save montage
+    montage_img = Image.fromarray(montage)
+    montage_img.save(os.path.join(output_dir, f'{prefix}_montage.png'))
+    
+    # Save middle slice separately
+    mid_idx = n_slices // 2
+    mid_img = Image.fromarray(vol_norm[:, :, mid_idx])
+    mid_img.save(os.path.join(output_dir, f'{prefix}_slice{mid_idx:03d}.png'))
+    
+    # Save all slices in a subfolder
+    slices_dir = os.path.join(output_dir, f'{prefix}_slices')
+    os.makedirs(slices_dir, exist_ok=True)
+    for i in range(n_slices):
+        slice_img = Image.fromarray(vol_norm[:, :, i])
+        slice_img.save(os.path.join(slices_dir, f'slice_{i:03d}.png'))
+
+
 def post_process_volume(recon, cond_slice_idx=None, smooth_sigma=0.8, 
                         intensity_smooth_sigma=2.0, mask_threshold=0.03):
     """
@@ -716,6 +765,15 @@ def validate_all(
                 cond_volume[:, :, cond_idx] = cond_slice
                 nib.save(nib.Nifti1Image(cond_volume, np.eye(4)), 
                         os.path.join(patient_dir, f'{patient_name}_input_cond.nii.gz'))
+                
+                # Save PNG images
+                save_volume_pngs(recon_proc, patient_dir, f'{patient_name}_reconstructed')
+                save_volume_pngs(target, patient_dir, f'{patient_name}_target')
+                
+                # Save conditioning slice as PNG
+                cond_slice_norm = (cond_slice - cond_slice.min()) / (cond_slice.max() - cond_slice.min() + 1e-8)
+                cond_img = Image.fromarray((cond_slice_norm * 255).astype(np.uint8))
+                cond_img.save(os.path.join(patient_dir, f'{patient_name}_input_slice{cond_idx:03d}.png'))
             
         except Exception as e:
             print(f"  ERROR: {e}")
