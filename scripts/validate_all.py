@@ -187,6 +187,55 @@ def match_intensity(recon, target):
     return result
 
 
+def save_volume_pngs(volume, output_dir, prefix, num_slices=9):
+    """Save PNG images of volume slices.
+    
+    Args:
+        volume: 3D numpy array (H, W, D)
+        output_dir: Directory to save images
+        prefix: Filename prefix
+        num_slices: Number of slices to save in the montage
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    n_slices = volume.shape[2]
+    
+    # Normalize volume to 0-255
+    vol_min, vol_max = volume.min(), volume.max()
+    if vol_max - vol_min > 1e-8:
+        vol_norm = ((volume - vol_min) / (vol_max - vol_min) * 255).astype(np.uint8)
+    else:
+        vol_norm = np.zeros_like(volume, dtype=np.uint8)
+    
+    # Save individual slices at key positions
+    slice_indices = np.linspace(0, n_slices - 1, num_slices, dtype=int)
+    
+    # Create montage image
+    n_cols = 3
+    n_rows = (num_slices + n_cols - 1) // n_cols
+    h, w = volume.shape[:2]
+    montage = np.zeros((n_rows * h, n_cols * w), dtype=np.uint8)
+    
+    for i, slice_idx in enumerate(slice_indices):
+        row, col = i // n_cols, i % n_cols
+        montage[row*h:(row+1)*h, col*w:(col+1)*w] = vol_norm[:, :, slice_idx]
+    
+    # Save montage
+    montage_img = Image.fromarray(montage)
+    montage_img.save(os.path.join(output_dir, f'{prefix}_montage.png'))
+    
+    # Save middle slice separately
+    mid_idx = n_slices // 2
+    mid_img = Image.fromarray(vol_norm[:, :, mid_idx])
+    mid_img.save(os.path.join(output_dir, f'{prefix}_slice{mid_idx:03d}.png'))
+    
+    # Save all slices in a subfolder
+    slices_dir = os.path.join(output_dir, f'{prefix}_slices')
+    os.makedirs(slices_dir, exist_ok=True)
+    for i in range(n_slices):
+        slice_img = Image.fromarray(vol_norm[:, :, i])
+        slice_img.save(os.path.join(slices_dir, f'slice_{i:03d}.png'))
+
+
 def post_process_volume(recon, target, cond_slice_idx=None, smooth_sigma=0.8):
     """Complete post-processing pipeline"""
     if cond_slice_idx is None:
@@ -226,7 +275,7 @@ def load_model_from_config(config, ckpt, device):
     """Load model from checkpoint"""
     print(f"Loading model from {ckpt}")
     
-    pl_sd = torch.load(ckpt, map_location='cpu', weights_only=False)
+    pl_sd = torch.load(ckpt, map_location='cpu')
     sd = pl_sd["state_dict"]
     del pl_sd
     gc.collect()
@@ -299,8 +348,9 @@ def sample_slice(input_im, T_cond, model, sampler, h, w, ddim_steps, scale, ddim
 
 def process_volume(dataloader, model, sampler, h, w, ddim_steps, scale, ddim_eta, device):
     """Process all slices for one volume"""
-    recon_slices = []
+    denoised_slices = []
     target_slices = []
+    input_slice = None
     cond_slice_idx = None
     
     for batch_idx, batch in enumerate(dataloader):
@@ -308,31 +358,42 @@ def process_volume(dataloader, model, sampler, h, w, ddim_steps, scale, ddim_eta
         input_im = batch["image_cond"].to(device)
         T_cond = batch['T'].to(device)
         
+        # Always capture the input slice from the first batch
+        if batch_idx == 0:
+            input_norm = torch.clamp((input_im + 1.0) / 2.0, 0.0, 1.0)
+            input_slice = input_norm[0].cpu().numpy()
+        
         if cond_slice_idx is None and torch.abs(T_cond).sum() < 0.1:
             cond_slice_idx = batch_idx
         
         output = sample_slice(input_im, T_cond, model, sampler, h, w, ddim_steps, scale, ddim_eta, device)
         
-        recon_slices.append(output[0].cpu().numpy())
+        denoised_slices.append(output[0].cpu().numpy())
         target_norm = torch.clamp((target + 1.0) / 2.0, 0.0, 1.0)
         target_slices.append(target_norm[0].cpu().numpy())
     
     if cond_slice_idx is None:
-        cond_slice_idx = len(recon_slices) // 2
+        cond_slice_idx = len(denoised_slices) // 2
     
     # Stack and format
-    recon = np.stack(recon_slices, axis=0)
+    denoised = np.stack(denoised_slices, axis=0)
     target = np.stack(target_slices, axis=0)
     
-    if recon.ndim == 4:
-        recon = recon[:, 0, :, :] if recon.shape[1] == 3 else recon[:, :, :, 0]
+    if denoised.ndim == 4:
+        denoised = denoised[:, 0, :, :] if denoised.shape[1] == 3 else denoised[:, :, :, 0]
     if target.ndim == 4:
         target = target[:, 0, :, :] if target.shape[1] == 3 else target[:, :, :, 0]
     
-    recon = np.transpose(recon, (1, 2, 0)).astype(np.float32)
+    # Format input slice
+    if input_slice is not None:
+        if input_slice.ndim == 3:
+            input_slice = input_slice[0] if input_slice.shape[0] == 3 else input_slice[:, :, 0]
+        input_slice = input_slice.astype(np.float32)
+    
+    denoised = np.transpose(denoised, (1, 2, 0)).astype(np.float32)
     target = np.transpose(target, (1, 2, 0)).astype(np.float32)
     
-    return recon, target, cond_slice_idx
+    return denoised, target, input_slice, cond_slice_idx
 
 
 def validate_all(
@@ -391,17 +452,17 @@ def validate_all(
             dataset.test_paths = [patient_path]
             dataloader = dataset.test_dataloader()
             
-            # Generate reconstruction
-            recon_raw, target, cond_idx = process_volume(
+            # Generate denoised volume
+            denoised_raw, target, input_slice, cond_idx = process_volume(
                 dataloader, model, sampler, image_size, image_size,
                 ddim_steps, guidance_scale, ddim_eta, device
             )
             
             # Post-process
-            recon_proc = post_process_volume(recon_raw, target, cond_idx, smooth_sigma)
+            denoised = post_process_volume(denoised_raw, target, cond_idx, smooth_sigma)
             
             # Metrics after post-processing
-            metrics_proc = compute_all_metrics(recon_proc, target)
+            metrics_proc = compute_all_metrics(denoised, target)
             
             result = {
                 'patient': patient_name,
@@ -417,10 +478,23 @@ def validate_all(
             if save_volumes:
                 patient_dir = os.path.join(output_dir, patient_name)
                 os.makedirs(patient_dir, exist_ok=True)
-                nib.save(nib.Nifti1Image(recon_proc, np.eye(4)), 
-                        os.path.join(patient_dir, f'{patient_name}_reconstructed.nii.gz'))
+                
+                # Save NIfTI files
+                nib.save(nib.Nifti1Image(denoised, np.eye(4)), 
+                        os.path.join(patient_dir, f'{patient_name}_denoised.nii.gz'))
                 nib.save(nib.Nifti1Image(target, np.eye(4)), 
                         os.path.join(patient_dir, f'{patient_name}_target.nii.gz'))
+                
+                # Save PNG images
+                save_volume_pngs(denoised, patient_dir, f'{patient_name}_denoised')
+                save_volume_pngs(target, patient_dir, f'{patient_name}_target')
+                
+                # Save input/conditioning slice
+                if input_slice is not None:
+                    input_img = Image.fromarray(
+                        ((input_slice - input_slice.min()) / (input_slice.max() - input_slice.min() + 1e-8) * 255).astype(np.uint8)
+                    )
+                    input_img.save(os.path.join(patient_dir, f'{patient_name}_input_slice{cond_idx:03d}.png'))
             
         except Exception as e:
             print(f"  ERROR: {e}")
