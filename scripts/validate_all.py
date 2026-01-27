@@ -617,12 +617,18 @@ def process_volume(dataloader, model, sampler, h, w, ddim_steps, scale, ddim_eta
     """Process all slices for one volume"""
     recon_slices = []
     target_slices = []
+    input_slice = None
     cond_slice_idx = None
     
     for batch_idx, batch in enumerate(dataloader):
         target = batch["image_target"].to(device)
         input_im = batch["image_cond"].to(device)
         T_cond = batch['T'].to(device)
+        
+        # Capture the conditioning input slice from the first batch
+        if batch_idx == 0:
+            input_norm = torch.clamp((input_im + 1.0) / 2.0, 0.0, 1.0)
+            input_slice = input_norm[0].cpu().numpy()
         
         if cond_slice_idx is None and torch.abs(T_cond).sum() < 0.1:
             cond_slice_idx = batch_idx
@@ -645,10 +651,16 @@ def process_volume(dataloader, model, sampler, h, w, ddim_steps, scale, ddim_eta
     if target.ndim == 4:
         target = target[:, 0, :, :] if target.shape[1] == 3 else target[:, :, :, 0]
     
+    # Format input slice
+    if input_slice is not None:
+        if input_slice.ndim == 3:
+            input_slice = input_slice[0] if input_slice.shape[0] == 3 else input_slice[:, :, 0]
+        input_slice = input_slice.astype(np.float32)
+    
     recon = np.transpose(recon, (1, 2, 0)).astype(np.float32)
     target = np.transpose(target, (1, 2, 0)).astype(np.float32)
     
-    return recon, target, cond_slice_idx
+    return recon, target, input_slice, cond_slice_idx
 
 
 def validate_all(
@@ -719,7 +731,7 @@ def validate_all(
             dataloader = dataset.test_dataloader()
             
             # Generate reconstruction
-            recon_raw, target, cond_idx = process_volume(
+            recon_raw, target, input_slice, cond_idx = process_volume(
                 dataloader, model, sampler, image_size, image_size,
                 ddim_steps, guidance_scale, ddim_eta, device
             )
@@ -770,10 +782,12 @@ def validate_all(
                 save_volume_pngs(recon_proc, patient_dir, f'{patient_name}_reconstructed')
                 save_volume_pngs(target, patient_dir, f'{patient_name}_target')
                 
-                # Save conditioning slice as PNG
-                cond_slice_norm = (cond_slice - cond_slice.min()) / (cond_slice.max() - cond_slice.min() + 1e-8)
-                cond_img = Image.fromarray((cond_slice_norm * 255).astype(np.uint8))
-                cond_img.save(os.path.join(patient_dir, f'{patient_name}_input_slice{cond_idx:03d}.png'))
+                # Save input/conditioning slice as PNG (from actual image_cond, not target)
+                if input_slice is not None:
+                    input_img = Image.fromarray(
+                        ((input_slice - input_slice.min()) / (input_slice.max() - input_slice.min() + 1e-8) * 255).astype(np.uint8)
+                    )
+                    input_img.save(os.path.join(patient_dir, f'{patient_name}_input_slice{cond_idx:03d}.png'))
             
         except Exception as e:
             print(f"  ERROR: {e}")
