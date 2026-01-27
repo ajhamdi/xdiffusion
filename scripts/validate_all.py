@@ -484,7 +484,7 @@ def load_model_from_config(config, ckpt, device):
     """Load model from checkpoint"""
     print(f"Loading model from {ckpt}")
     
-    pl_sd = torch.load(ckpt, map_location='cpu', weights_only=False)
+    pl_sd = torch.load(ckpt, map_location='cpu')
     sd = pl_sd["state_dict"]
     del pl_sd
     gc.collect()
