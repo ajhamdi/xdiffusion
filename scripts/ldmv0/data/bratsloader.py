@@ -157,32 +157,36 @@ class BratsDataset(Dataset):
             
             if self.process_all_slices:
                 # Process ALL slices along the Z-axis (axial view)
+                # SINGLE-SLICE-TO-FULL-VOLUME: Use middle slice as conditioning input
+                # Target iterates over all 155 slices
                 axis_choice = '001'  # Use Z-axis for consistency
                 
-                for slice_idx in range(min(dim2, MAX_DIM)):  # Process all 155 slices
-                    # Use current slice as both input and target for now
-                    # You can modify this to use adjacent slices if needed
+                # Middle slice index (~77) - used as the FIXED conditioning input
+                middle_slice_idx = min(dim2, MAX_DIM) // 2
+                
+                # Process middle slice once as the conditioning input
+                middle_slice_data = img_norm[:,:,middle_slice_idx]
+                middle_slice_rgb = np.repeat(middle_slice_data[..., np.newaxis], 3, axis=2)
+                middle_slice_img = Image.fromarray(np.uint8(middle_slice_rgb * 255.))
+                middle_slice_transformed = self.tform(middle_slice_img)
+                
+                for slice_idx in range(min(dim2, MAX_DIM)):  # Process all 155 slices as targets
+                    # Conditioning input: ALWAYS the middle slice
+                    # Target: current slice being generated
                     
-                    # Get the slice
-                    slice_data = img_norm[:,:,slice_idx]
-                    
-                    # Process as input image
-                    img_slice = np.repeat(slice_data[..., np.newaxis], 3, axis=2)
-                    img_slice = Image.fromarray(np.uint8(img_slice * 255.))
-                    img_slice = self.tform(img_slice)
-                    
-                    # For target, you could use the same slice or adjacent slice
-                    # Here using same slice for simplicity
-                    target_slice = slice_data
+                    # Target slice (what we want the model to generate)
+                    target_slice = img_norm[:,:,slice_idx]
                     target_slice = np.repeat(target_slice[..., np.newaxis], 3, axis=2)
                     target_slice = Image.fromarray(np.uint8(target_slice * 255.))
                     target_slice = self.tform(target_slice)
                     
-                    self.imgs.append(img_slice)
+                    # Input is ALWAYS the middle slice
+                    self.imgs.append(middle_slice_transformed)
                     self.targets.append(target_slice)
                     self.filenames.append(f"{patient_id}_slice_{slice_idx:03d}")
                     
                     # Store axis and depth information
+                    # T_cond encodes the TARGET slice position (what to generate)
                     self.rotation_axis.append(['001', '001'])  # Both using Z-axis
                     self.depth.append(2*(slice_idx/MAX_DIM)-1)  # Normalize to [-1, 1]
                     

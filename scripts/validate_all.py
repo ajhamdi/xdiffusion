@@ -18,7 +18,7 @@ import torch
 from einops import rearrange
 from ldmv0.models.diffusion.ddim import DDIMSampler
 from omegaconf import OmegaConf
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torch import autocast
 from ldmv0.util import instantiate_from_config
 import os 
@@ -475,6 +475,85 @@ def save_volume_pngs(volume, output_dir, prefix, num_slices=9):
         slice_img.save(os.path.join(slices_dir, f'slice_{i:03d}.png'))
 
 
+def create_comparison_gif(output_volume, target_volume, output_path, fps=5, image_size=256):
+    """
+    Create a GIF showing output and target volume slices side by side with labels.
+    
+    Args:
+        output_volume: Output/reconstructed volume (H, W, D)
+        target_volume: Target/ground truth volume (H, W, D)
+        output_path: Path to save the GIF
+        fps: Frames per second
+        image_size: Size of each image panel
+    """
+    frames = []
+    label_height = 30
+    n_slices = output_volume.shape[2]
+    
+    # Normalize volumes to 0-255
+    def normalize_volume(vol):
+        vol_min, vol_max = vol.min(), vol.max()
+        if vol_max - vol_min > 1e-8:
+            return ((vol - vol_min) / (vol_max - vol_min) * 255).astype(np.uint8)
+        return np.zeros_like(vol, dtype=np.uint8)
+    
+    output_norm = normalize_volume(output_volume)
+    target_norm = normalize_volume(target_volume)
+    
+    for idx in range(n_slices):
+        output_slice = output_norm[:, :, idx]
+        target_slice = target_norm[:, :, idx]
+        
+        # Resize if needed
+        if output_slice.shape[0] != image_size or output_slice.shape[1] != image_size:
+            output_img = Image.fromarray(output_slice).resize((image_size, image_size))
+            output_slice = np.array(output_img)
+        if target_slice.shape[0] != image_size or target_slice.shape[1] != image_size:
+            target_img = Image.fromarray(target_slice).resize((image_size, image_size))
+            target_slice = np.array(target_img)
+        
+        # Create combined frame with labels
+        frame_width = image_size * 2 + 10  # 10 pixels gap
+        frame_height = image_size + label_height
+        frame = Image.new('RGB', (frame_width, frame_height), color=(30, 30, 30))
+        draw = ImageDraw.Draw(frame)
+        
+        # Try to use a better font, fall back to default
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+        except:
+            font = ImageFont.load_default()
+        
+        # Add labels
+        output_label = f"Output (Slice {idx+1}/{n_slices})"
+        target_label = f"Target (Slice {idx+1}/{n_slices})"
+        
+        draw.text((image_size//2 - 60, 5), output_label, fill=(100, 255, 100), font=font)
+        draw.text((image_size + 10 + image_size//2 - 60, 5), target_label, fill=(255, 255, 255), font=font)
+        
+        # Add images
+        output_pil = Image.fromarray(output_slice).convert('RGB')
+        target_pil = Image.fromarray(target_slice).convert('RGB')
+        
+        frame.paste(output_pil, (0, label_height))
+        frame.paste(target_pil, (image_size + 10, label_height))
+        
+        frames.append(frame)
+    
+    # Save as GIF
+    if frames:
+        duration = int(1000 / fps)  # Convert fps to milliseconds per frame
+        frames[0].save(
+            output_path,
+            save_all=True,
+            append_images=frames[1:],
+            duration=duration,
+            loop=0
+        )
+        print(f"  GIF saved: {output_path}")
+        print(f"    - {len(frames)} frames, {fps} fps, duration: {len(frames) / fps:.1f}s")
+
+
 def post_process_volume(recon, cond_slice_idx=None, smooth_sigma=0.8, 
                         intensity_smooth_sigma=2.0, mask_threshold=0.03):
     """
@@ -614,24 +693,28 @@ def sample_slice(input_im, T_cond, model, sampler, h, w, ddim_steps, scale, ddim
 # =============================================================================
 
 def process_volume(dataloader, model, sampler, h, w, ddim_steps, scale, ddim_eta, device):
-    """Process all slices for one volume"""
+    """
+    Process all slices for one volume.
+    
+    SINGLE-SLICE-TO-FULL-VOLUME reconstruction:
+    - Input condition: ALWAYS the middle slice (~77) for ALL generations
+    - Target: Iterates over all 155 slices
+    - T_cond: Positional embedding indicating which slice to generate
+    """
     recon_slices = []
     target_slices = []
     input_slice = None
-    cond_slice_idx = None
+    n_slices = None
     
     for batch_idx, batch in enumerate(dataloader):
         target = batch["image_target"].to(device)
-        input_im = batch["image_cond"].to(device)
+        input_im = batch["image_cond"].to(device)  # Always the middle slice
         T_cond = batch['T'].to(device)
         
-        # Capture the conditioning input slice from the first batch
+        # Capture the conditioning input slice (same for all batches - middle slice)
         if batch_idx == 0:
             input_norm = torch.clamp((input_im + 1.0) / 2.0, 0.0, 1.0)
             input_slice = input_norm[0].cpu().numpy()
-        
-        if cond_slice_idx is None and torch.abs(T_cond).sum() < 0.1:
-            cond_slice_idx = batch_idx
         
         output = sample_slice(input_im, T_cond, model, sampler, h, w, ddim_steps, scale, ddim_eta, device)
         
@@ -639,8 +722,9 @@ def process_volume(dataloader, model, sampler, h, w, ddim_steps, scale, ddim_eta
         target_norm = torch.clamp((target + 1.0) / 2.0, 0.0, 1.0)
         target_slices.append(target_norm[0].cpu().numpy())
     
-    if cond_slice_idx is None:
-        cond_slice_idx = len(recon_slices) // 2
+    # The conditioning slice is always the middle slice
+    n_slices = len(recon_slices)
+    cond_slice_idx = n_slices // 2  # Middle slice (~77 for 155 slices)
     
     # Stack and format
     recon = np.stack(recon_slices, axis=0)
@@ -788,6 +872,16 @@ def validate_all(
                         ((input_slice - input_slice.min()) / (input_slice.max() - input_slice.min() + 1e-8) * 255).astype(np.uint8)
                     )
                     input_img.save(os.path.join(patient_dir, f'{patient_name}_input_slice{cond_idx:03d}.png'))
+                
+                # Save comparison GIF showing output and target side by side
+                gif_path = os.path.join(patient_dir, f'{patient_name}_comparison.gif')
+                create_comparison_gif(
+                    output_volume=recon_proc,
+                    target_volume=target,
+                    output_path=gif_path,
+                    fps=5,
+                    image_size=image_size
+                )
             
         except Exception as e:
             print(f"  ERROR: {e}")
