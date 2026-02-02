@@ -1,0 +1,120 @@
+model:
+  base_learning_rate: 1.0e-05  
+  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  params:
+    ckpt_path: '/work/emmanuelle/zero123/zero123/105000.ckpt.1' #Zero-123 checkpoint
+    linear_start: 0.00085
+    linear_end: 0.0060
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: "image_target"
+    cond_stage_key: "image_cond"
+    image_size: 32
+    channels: 4
+    cond_stage_trainable: false
+    conditioning_key: hybrid  # concat (cond image) + crossattn (CLIP + T)
+    monitor: val/loss_simple
+    scale_factor: 0.18215
+    use_ema: false
+    unet_trainable: true
+        
+    scheduler_config:
+      target: ldm.lr_scheduler.LambdaLinearScheduler
+      params:
+        warm_up_steps: [1000]  # Warmup for stability
+        cycle_lengths: [10000000000000]
+        f_start: [0.01]  # Start at 1% of base LR
+        f_max: [1.]
+        f_min: [1.]
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 32
+        in_channels: 8  # 4 (latent) + 4 (conditioning latent)
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions: [4, 2, 1]
+        num_res_blocks: 2
+        channel_mult: [1, 2, 4, 4]
+        num_heads: 8
+        use_spatial_transformer: true
+        transformer_depth: 1
+        context_dim: 768  # CLIP embedding dimension
+        use_checkpoint: true  # Gradient checkpointing for memory
+        legacy: false
+
+    first_stage_config:
+      target: ldm.models.autoencoder.AutoencoderKL
+      params:
+        embed_dim: 4
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult: [1, 2, 4, 4]
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity
+
+    cond_stage_config:
+      target: ldm.modules.encoders.modules.FrozenCLIPImageEmbedder
+
+data:
+  target: ldm.data.bratsloader_multislice.BratsMultiSliceDataModule
+  params:
+    root_dir: '/work/emmanuelle/Task01_BrainTumour/ASNR-MICCAI-BraTS2023-GLI/'
+    batch_size: 2  
+    num_cond_slices: 3  # 25%, 50%, 75% key slices
+    cond_strategy: 'key_slices' 
+    num_workers: 8
+    image_size: 256
+    train_val_split: 0.85
+    max_train_volumes: 50 
+
+
+lightning:
+  find_unused_parameters: false
+  
+  metrics_over_trainsteps_checkpoint: true
+  
+  modelcheckpoint:
+    params:
+      every_n_train_steps: 1000  # Save every 1000 steps
+      save_top_k: 3  # Keep top 3 checkpoints
+      monitor: val/loss_simple
+      mode: min
+  
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 2000  # Log images every 2000 steps
+        max_images: 2
+        increase_log_steps: false
+        log_first_step: false
+        log_images_kwargs:
+          use_ema_scope: false
+          inpaint: false
+          plot_progressive_rows: false
+          plot_diffusion_rows: false
+          N: 2
+          unconditional_guidance_scale: 3.0
+          unconditional_guidance_label: [""]
+          ddim_steps: 50  # Fast sampling for logging
+
+  trainer:
+    benchmark: true
+    val_check_interval: 1.0  # Validate every epoch
+    num_sanity_val_steps: 0
+    accumulate_grad_batches: 2  # Effective batch size = 2 × 2 = 4
+    max_epochs: 100
+    gradient_clip_val: 0.5  
+    precision: 32  

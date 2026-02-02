@@ -19,283 +19,219 @@ if version.parse(torch.__version__) >= version.parse("1.7.0"):
     import torch.fft  # type: ignore
 
 
-def fft2c_old(data: torch.Tensor, norm: str = "ortho") -> torch.Tensor:
-    """
-    Apply centered 2 dimensional Fast Fourier Transform.
-    Args:
-        data: Complex valued input data containing at least 3 dimensions:
-            dimensions -3 & -2 are spatial dimensions and dimension -1 has size
-            2. All other dimensions are assumed to be batch dimensions.
-        norm: Whether to include normalization. Must be one of ``"backward"``
-            or ``"ortho"``. See ``torch.fft.fft`` on PyTorch 1.9.0 for details.
-    Returns:
-        The FFT of the input.
-    """
+def check_backward_validity(inputs):
+    if not any(inp.requires_grad for inp in inputs if isinstance(inp, torch.Tensor)):
+        import warnings
+        warnings.warn("None of the inputs have requires_grad=True. Gradients will be None")
+
+
+def get_device_states(*args):
+    unique_devices = set(
+        arg.get_device() for arg in args
+        if isinstance(arg, torch.Tensor) and arg.is_cuda
+    )
+    return list(unique_devices), [torch.cuda.get_rng_state(d) for d in unique_devices]
+
+
+def set_device_states(devices, states):
+    for device, state in zip(devices, states):
+        torch.cuda.set_rng_state(state, device)
+
+
+class CheckpointFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, run_function, preserve_rng_state, *args):
+        check_backward_validity(args)
+        ctx.run_function = run_function
+        ctx.preserve_rng_state = preserve_rng_state
+
+        ctx.had_autocast_in_fwd = torch.is_autocast_enabled()
+       
+
+        if preserve_rng_state:
+            ctx.fwd_cpu_state = torch.random.get_rng_state()
+            ctx.had_cuda_in_fwd = False
+            if torch.cuda._initialized:
+                ctx.had_cuda_in_fwd = True
+                ctx.fwd_gpu_devices, ctx.fwd_gpu_states = get_device_states(*args)
+        ctx.save_for_backward(*args)
+        with torch.no_grad():
+            outputs = run_function(*args)
+        return outputs
+
+    @staticmethod
+    def backward(ctx, *args):
+        if not torch.autograd._is_checkpoint_valid():
+            raise RuntimeError(
+                "Checkpointing is not compatible with .grad(), use .backward() if possible"
+            )
+        inputs = ctx.saved_tensors
+
+        rng_devices = []
+        if ctx.preserve_rng_state and ctx.had_cuda_in_fwd:
+            rng_devices = ctx.fwd_gpu_devices
+
+        with torch.random.fork_rng(devices=rng_devices, enabled=ctx.preserve_rng_state):
+            if ctx.preserve_rng_state:
+                torch.random.set_rng_state(ctx.fwd_cpu_state)
+                if ctx.had_cuda_in_fwd:
+                    set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
+
+            detached_inputs = tuple(
+                x.detach().requires_grad_(x.requires_grad) for x in inputs
+            )
+
+            # ── NEW ──────────────────────────────────────────────────────
+            # Restore the autocast state that was active during forward so
+            # the recomputed activations have the same dtypes as the
+            # originals.  Without this, FP16 mixed-precision training
+            # crashes inside any op that sees mismatched input/weight dtypes
+            # (most visibly: LayerNorm via F.layer_norm).
+            with torch.cuda.amp.autocast(enabled=ctx.had_autocast_in_fwd):
+                with torch.enable_grad():
+                    outputs = ctx.run_function(*detached_inputs)
+            # ─────────────────────────────────────────────────────────────
+
+        if isinstance(outputs, torch.Tensor):
+            outputs = (outputs,)
+
+        outputs_with_grad = []
+        args_with_grad = []
+        for i in range(len(outputs)):
+            if torch.is_tensor(outputs[i]) and outputs[i].requires_grad:
+                outputs_with_grad.append(outputs[i])
+                args_with_grad.append(args[i])
+        if len(outputs_with_grad) == 0:
+            raise RuntimeError(
+                "None of the outputs have requires_grad=True. Gradients will be None"
+            )
+        torch.autograd.backward(outputs_with_grad, args_with_grad)
+        grads = tuple(
+            inp.grad if isinstance(inp, torch.Tensor) else inp
+            for inp in detached_inputs
+        )
+        return (None, None) + grads
+
+
+def checkpoint(run_function, *args, **kwargs):
+    preserve = kwargs.pop('preserve_rng_state', True)
+    if kwargs:
+        raise ValueError("Unexpected keyword arguments: " + str(kwargs))
+    return CheckpointFunction.apply(run_function, preserve, *args)
+
+
+
+def default(val, d):
+    return val if val is not None else (d() if callable(d) else d)
+
+def exists(x):
+    return x is not None
+
+
+def noop(*args, **kwargs):
+    pass
+
+
+# --- FFT helpers (version-aware) ---------------------------------------------
+
+def fft2c_old(data):
     if not data.shape[-1] == 2:
         raise ValueError("Tensor does not have separate complex dim.")
-    if norm not in ("ortho", "backward"):
-        raise ValueError("norm must be 'ortho' or 'backward'.")
-    normalized = True if norm == "ortho" else False
-
     data = ifftshift(data, dim=[-3, -2])
-    data = torch.fft(data, 2, normalized=normalized)
+    data = torch.fft(data, 2, normalized=True)
     data = fftshift(data, dim=[-3, -2])
-
     return data
 
 
-def ifft2c_old(data: torch.Tensor, norm: str = "ortho") -> torch.Tensor:
-    """
-    Apply centered 2-dimensional Inverse Fast Fourier Transform.
-    Args:
-        data: Complex valued input data containing at least 3 dimensions:
-            dimensions -3 & -2 are spatial dimensions and dimension -1 has size
-            2. All other dimensions are assumed to be batch dimensions.
-        norm: Whether to include normalization. Must be one of ``"backward"``
-            or ``"ortho"``. See ``torch.fft.ifft`` on PyTorch 1.9.0 for
-            details.
-    Returns:
-        The IFFT of the input.
-    """
+def ifft2c_old(data):
     if not data.shape[-1] == 2:
         raise ValueError("Tensor does not have separate complex dim.")
-    if norm not in ("ortho", "backward"):
-        raise ValueError("norm must be 'ortho' or 'backward'.")
-    normalized = True if norm == "ortho" else False
-
     data = ifftshift(data, dim=[-3, -2])
-    data = torch.ifft(data, 2, normalized=normalized)
+    data = torch.ifft(data, 2, normalized=True)
     data = fftshift(data, dim=[-3, -2])
-
     return data
 
 
-def fft2c_new(data: torch.Tensor, norm: str = "ortho") -> torch.Tensor:
-    """
-    Apply centered 2 dimensional Fast Fourier Transform.
-    Args:
-        data: Complex valued input data containing at least 3 dimensions:
-            dimensions -3 & -2 are spatial dimensions and dimension -1 has size
-            2. All other dimensions are assumed to be batch dimensions.
-        norm: Normalization mode. See ``torch.fft.fft``.
-    Returns:
-        The FFT of the input.
-    """
+def fft2c_new(data):
     if not data.shape[-1] == 2:
         raise ValueError("Tensor does not have separate complex dim.")
-
     data = ifftshift(data, dim=[-3, -2])
     data = torch.view_as_real(
-        torch.fft.fftn(  # type: ignore
-            torch.view_as_complex(data), dim=(-2, -1), norm=norm
-        )
+        torch.fft.fftn(torch.view_as_complex(data), dim=(-2, -1), norm="ortho")
     )
     data = fftshift(data, dim=[-3, -2])
-
     return data
 
 
-def ifft2c_new(data: torch.Tensor, norm: str = "ortho") -> torch.Tensor:
-    """
-    Apply centered 2-dimensional Inverse Fast Fourier Transform.
-    Args:
-        data: Complex valued input data containing at least 3 dimensions:
-            dimensions -3 & -2 are spatial dimensions and dimension -1 has size
-            2. All other dimensions are assumed to be batch dimensions.
-        norm: Normalization mode. See ``torch.fft.ifft``.
-    Returns:
-        The IFFT of the input.
-    """
+def ifft2c_new(data):
     if not data.shape[-1] == 2:
         raise ValueError("Tensor does not have separate complex dim.")
-
     data = ifftshift(data, dim=[-3, -2])
     data = torch.view_as_real(
-        torch.fft.ifftn(  # type: ignore
-            torch.view_as_complex(data), dim=(-2, -1), norm=norm
-        )
+        torch.fft.ifftn(torch.view_as_complex(data), dim=(-2, -1), norm="ortho")
     )
     data = fftshift(data, dim=[-3, -2])
-
     return data
 
 
-# Helper functions
+if version.parse(torch.__version__) >= version.parse("1.7.0"):
+    fft2c = fft2c_new
+    ifft2c = ifft2c_new
+else:
+    fft2c = fft2c_old
+    ifft2c = ifft2c_old
 
 
-def roll_one_dim(x: torch.Tensor, shift: int, dim: int) -> torch.Tensor:
-    """
-    Similar to roll but for only one dim.
-    Args:
-        x: A PyTorch tensor.
-        shift: Amount to roll.
-        dim: Which dimension to roll.
-    Returns:
-        Rolled version of x.
-    """
+# --- roll / shift ------------------------------------------------------------
+
+def roll_one_dim(x, shift, dim):
     shift = shift % x.size(dim)
     if shift == 0:
         return x
-
-    left = x.narrow(dim, 0, x.size(dim) - shift)
+    left  = x.narrow(dim, 0, x.size(dim) - shift)
     right = x.narrow(dim, x.size(dim) - shift, shift)
-
     return torch.cat((right, left), dim=dim)
 
 
-def roll(
-    x: torch.Tensor,
-    shift: List[int],
-    dim: List[int],
-) -> torch.Tensor:
-    """
-    Similar to np.roll but applies to PyTorch Tensors.
-    Args:
-        x: A PyTorch tensor.
-        shift: Amount to roll.
-        dim: Which dimension to roll.
-    Returns:
-        Rolled version of x.
-    """
+def roll(x, shift, dim):
     if len(shift) != len(dim):
         raise ValueError("len(shift) must match len(dim)")
-
     for (s, d) in zip(shift, dim):
         x = roll_one_dim(x, s, d)
-
     return x
 
 
-def fftshift(x: torch.Tensor, dim: Optional[List[int]] = None) -> torch.Tensor:
-    """
-    Similar to np.fft.fftshift but applies to PyTorch Tensors
-    Args:
-        x: A PyTorch tensor.
-        dim: Which dimension to fftshift.
-    Returns:
-        fftshifted version of x.
-    """
+def fftshift(x, dim=None):
     if dim is None:
-        # this weird code is necessary for toch.jit.script typing
-        dim = [0] * (x.dim())
-        for i in range(1, x.dim()):
-            dim[i] = i
-
-    # also necessary for torch.jit.script
-    shift = [0] * len(dim)
-    for i, dim_num in enumerate(dim):
-        shift[i] = x.shape[dim_num] // 2
-
+        dim = list(range(x.dim()))
+    shift = [x.shape[d] // 2 for d in dim]
     return roll(x, shift, dim)
 
 
-def ifftshift(x: torch.Tensor, dim: Optional[List[int]] = None) -> torch.Tensor:
-    """
-    Similar to np.fft.ifftshift but applies to PyTorch Tensors
-    Args:
-        x: A PyTorch tensor.
-        dim: Which dimension to ifftshift.
-    Returns:
-        ifftshifted version of x.
-    """
+def ifftshift(x, dim=None):
     if dim is None:
-        # this weird code is necessary for toch.jit.script typing
-        dim = [0] * (x.dim())
-        for i in range(1, x.dim()):
-            dim[i] = i
-
-    # also necessary for torch.jit.script
-    shift = [0] * len(dim)
-    for i, dim_num in enumerate(dim):
-        shift[i] = (x.shape[dim_num] + 1) // 2
-
+        dim = list(range(x.dim()))
+    shift = [(x.shape[d] + 1) // 2 for d in dim]
     return roll(x, shift, dim)
 
-def pil_rectangle_crop(im):
-    width, height = im.size   # Get dimensions
-    
-    if width <= height:
-        left = 0
-        right = width
-        top = (height - width)/2
-        bottom = (height + width)/2
-    else:
-        
-        top = 0
-        bottom = height
-        left = (width - height) / 2
-        bottom = (width + height) / 2
 
-    # Crop the center of the image
-    im = im.crop((left, top, right, bottom))
-    return im
-
-def add_margin(pil_img, color, size=256):
-    width, height = pil_img.size
-    result = Image.new(pil_img.mode, (size, size), color)
-    result.paste(pil_img, ((size - width) // 2, (size - height) // 2))
-    return result
-
-
-def create_carvekit_interface():
-    # Check doc strings for more information
-    interface = HiInterface(object_type="object",  # Can be "object" or "hairs-like".
-                            batch_size_seg=5,
-                            batch_size_matting=1,
-                            device='cuda' if torch.cuda.is_available() else 'cpu',
-                            seg_mask_size=640,  # Use 640 for Tracer B7 and 320 for U2Net
-                            matting_mask_size=2048,
-                            trimap_prob_threshold=231,
-                            trimap_dilation=30,
-                            trimap_erosion_iters=5,
-                            fp16=False)
-
-    return interface
-
-
-def load_and_preprocess(interface, input_im):
-    '''
-    :param input_im (PIL Image).
-    :return image (H, W, 3) array in [0, 1].
-    '''
-    # See https://github.com/Ir1d/image-background-remove-tool
-    image = input_im.convert('RGB')
-
-    image_without_background = interface([image])[0]
-    image_without_background = np.array(image_without_background)
-    est_seg = image_without_background > 127
-    image = np.array(image)
-    foreground = est_seg[:, : , -1].astype(np.bool_)
-    image[~foreground] = [255., 255., 255.]
-    x, y, w, h = cv2.boundingRect(foreground.astype(np.uint8))
-    image = image[y:y+h, x:x+w, :]
-    image = PIL.Image.fromarray(np.array(image))
-    
-    # resize image such that long edge is 512
-    image.thumbnail([200, 200], Image.Resampling.LANCZOS)
-    image = add_margin(image, (255, 255, 255), size=256)
-    image = np.array(image)
-    
-    return image
-
+# --- logging / image helpers -------------------------------------------------
 
 def log_txt_as_img(wh, xc, size=10):
-    # wh a tuple of (width, height)
-    # xc a list of captions to plot
+    from PIL import Image, ImageDraw, ImageFont
     b = len(xc)
     txts = list()
     for bi in range(b):
         txt = Image.new("RGB", wh, color="white")
         draw = ImageDraw.Draw(txt)
-        font = ImageFont.truetype('data/DejaVuSans.ttf', size=size)
         nc = int(40 * (wh[0] / 256))
-        lines = "\n".join(xc[bi][start:start + nc] for start in range(0, len(xc[bi]), nc))
-
+        lines = "\n".join(
+            xc[bi][start:start + nc] for start in range(0, len(xc[bi]), nc)
+        )
         try:
-            draw.text((0, 0), lines, fill="black", font=font)
+            draw.text((0, 0), lines, fill="black")
         except UnicodeEncodeError:
-            print("Cant encode string for logging. Skipping.")
-
+            print("Can't encode string for logging. Skipping.")
         txt = np.array(txt).transpose(2, 0, 1) / 127.5 - 1.0
         txts.append(txt)
     txts = np.stack(txts)
@@ -310,38 +246,26 @@ def ismap(x):
 
 
 def isimage(x):
-    if not isinstance(x,torch.Tensor):
+    if not isinstance(x, torch.Tensor):
         return False
     return (len(x.shape) == 4) and (x.shape[1] == 3 or x.shape[1] == 1)
 
 
-def exists(x):
-    return x is not None
-
-
-def default(val, d):
-    if exists(val):
-        return val
-    return d() if isfunction(d) else d
-
-
 def mean_flat(tensor):
-    """
-    https://github.com/openai/guided-diffusion/blob/27c20a8fab9cb472df5d6bdd6c8d11c8f430b924/guided_diffusion/nn.py#L86
-    Take the mean over all non-batch dimensions.
-    """
     return tensor.mean(dim=list(range(1, len(tensor.shape))))
 
 
 def count_params(model, verbose=False):
     total_params = sum(p.numel() for p in model.parameters())
     if verbose:
-        print(f"{model.__class__.__name__} has {total_params*1.e-6:.2f} M params.")
+        print(f"{model.__class__.__name__} has {total_params * 1.e-6:.2f} M params.")
     return total_params
 
 
+# --- instantiation helpers ---------------------------------------------------
+
 def instantiate_from_config(config):
-    if not "target" in config:
+    if "target" not in config:
         if config == '__is_first_stage__':
             return None
         elif config == "__is_unconditional__":
@@ -356,6 +280,7 @@ def get_obj_from_str(string, reload=False):
         module_imp = importlib.import_module(module)
         importlib.reload(module_imp)
     return getattr(importlib.import_module(module, package=None), cls)
+
 
 
 class AdamWwithEMAandWings(optim.Optimizer):

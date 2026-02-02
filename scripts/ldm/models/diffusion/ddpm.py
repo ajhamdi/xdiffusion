@@ -205,10 +205,19 @@ class DDPM(pl.LightningModule):
 
     @torch.no_grad()
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
-        sd = torch.load(path, map_location="cpu")
+        sd = torch.load(path, map_location="cpu", weights_only=False)  # weights_only=False for PyTorch 2.6+
         if "state_dict" in list(sd.keys()):
             sd = sd["state_dict"]
         keys = list(sd.keys())
+        
+        # For MRI finetuning with CLIP, we keep the pretrained cc_projection
+        # Only ignore keys that don't exist in the new model
+        
+        # Filter out ignored keys
+        for ik in ignore_keys:
+            if ik in sd:
+                print(f"Ignoring key {ik} from checkpoint (will learn fresh)")
+                del sd[ik]
 
         if self.make_it_fit:
             n_params = len([name for name, _ in
@@ -444,7 +453,8 @@ class DDPM(pl.LightningModule):
         loss_dict.update({f'{log_prefix}/loss_simple': loss.mean()})
         loss_simple = loss.mean() * self.l_simple_weight
 
-        loss_vlb = (self.lvlb_weights[t] * loss).mean()
+        # Fix device mismatch for lvlb_weights
+        loss_vlb = (self.lvlb_weights.to(self.device)[t] * loss).mean()
         loss_dict.update({f'{log_prefix}/loss_vlb': loss_vlb})
 
         loss = loss_simple + self.original_elbo_weight * loss_vlb
@@ -555,11 +565,13 @@ class DDPM(pl.LightningModule):
         return log
 
     def configure_optimizers(self):
+        # Use SGD in base class to avoid OOM (this may be called if LatentDiffusion's isn't)
         lr = self.learning_rate
         params = list(self.model.parameters())
         if self.learn_logvar:
             params = params + [self.logvar]
-        opt = torch.optim.AdamW(params, lr=lr)
+        print(f"DDPM.configure_optimizers called - using SGD with lr={lr}")
+        opt = torch.optim.SGD(params, lr=lr * 10, momentum=0.9)
         return opt
 
 
@@ -605,7 +617,7 @@ class LatentDiffusion(DDPM):
         self.instantiate_cond_stage(cond_stage_config)
         self.cond_stage_forward = cond_stage_forward
 
-        # construct linear projection layer for concatenating image CLIP embedding and RT
+        # construct linear projection layer for concatenating MRI embedding and T (positional encoding)
         self.cc_projection = nn.Linear(772, 768)
         nn.init.eye_(list(self.cc_projection.parameters())[0][:768, :768])
         nn.init.zeros_(list(self.cc_projection.parameters())[1])
@@ -826,24 +838,27 @@ class LatentDiffusion(DDPM):
         random = torch.rand(x.size(0), device=x.device)
         prompt_mask = rearrange(random < 2 * uncond, "n -> n 1 1")
         input_mask = 1 - rearrange((random >= uncond).float() * (random < 3 * uncond).float(), "n -> n 1 1 1")
-        null_prompt = self.get_learned_conditioning([""])
 
         # z.shape: [8, 4, 64, 64]; c.shape: [8, 1, 768]
-        # print('=========== xc shape ===========', xc.shape)
         with torch.enable_grad():
             clip_emb = self.get_learned_conditioning(xc).detach()
             null_prompt = self.get_learned_conditioning([""]).detach()
             cond["c_crossattn"] = [self.cc_projection(torch.cat([torch.where(prompt_mask, null_prompt, clip_emb), T[:, None, :]], dim=-1))]
-        cond["c_concat"] = [input_mask * self.encode_first_stage((xc.to(self.device))).mode().detach()]
+        
+        #cond["c_concat"] = [input_mask * self.encode_first_stage((xc.to(self.device))).mode().detach()]
+        cond["c_concat"] = [input_mask * self.get_first_stage_encoding(self.encode_first_stage(xc.to(self.device))).detach()]
+        
         out = [z, cond]
         if return_first_stage_outputs:
             xrec = self.decode_first_stage(z)
             out.extend([x, xrec])
             
-            # Save Predictions
+            # Save Predictions (optional debug output)
+            # Create directory if it doesn't exist
             output_ims = []
             count = 0
             subroot = '/work/emmanuelle/zero123/results2/'
+            os.makedirs(subroot, exist_ok=True)
             for x_sample in xrec:
                 ##x_sample = torch.clamp(x_sample, -1., 1.)
                 x_sample = torch.clamp((x_sample + 1.0) / 2.0, min=0.0, max=1.0).cpu()
@@ -972,7 +987,7 @@ class LatentDiffusion(DDPM):
             # if self.cond_stage_trainable:
             #     c = self.get_learned_conditioning(c)
             if self.shorten_cond_schedule:  # TODO: drop this option
-                tc = self.cond_ids[t].to(self.device)
+                tc = self.cond_ids.to(self.device)[t]
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
         return self.p_losses(x, c, t, *args, **kwargs)
 
@@ -1126,7 +1141,8 @@ class LatentDiffusion(DDPM):
         #ssim = self.ssim_metric(model_output, target)
         #loss_dict.update({f'{prefix}/SSIM': ssim})
 
-        logvar_t = self.logvar[t].to(self.device)
+        # Fix device mismatch: move logvar to device before indexing
+        logvar_t = self.logvar.to(self.device)[t]
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
         # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:
@@ -1136,7 +1152,8 @@ class LatentDiffusion(DDPM):
         loss = self.l_simple_weight * loss.mean()
 
         loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
-        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
+        # Fix device mismatch for lvlb_weights
+        loss_vlb = (self.lvlb_weights.to(self.device)[t] * loss_vlb).mean()
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
         loss += (self.original_elbo_weight * loss_vlb)
         loss_dict.update({f'{prefix}/loss': loss})
@@ -1495,35 +1512,53 @@ class LatentDiffusion(DDPM):
         return log
 
     def configure_optimizers(self):
+        print("=" * 60)
+        print("LatentDiffusion.configure_optimizers called")
+        print("=" * 60)
         lr = self.learning_rate
-        params = []
-        if self.unet_trainable == "attn":
-            print("Training only unet attention layers")
-            for n, m in self.model.named_modules():
-                if isinstance(m, CrossAttention) and n.endswith('attn2'):
-                    params.extend(m.parameters())
-        if self.unet_trainable == "conv_in":
-            print("Training only unet input conv layers")
-            params = list(self.model.diffusion_model.input_blocks[0][0].parameters())
-        elif self.unet_trainable is True or self.unet_trainable == "all":
-            print("Training the full unet")
-            params = list(self.model.parameters())
-        else:
-            raise ValueError(f"Unrecognised setting for unet_trainable: {self.unet_trainable}")
-
+        params = list(self.model.parameters())
         if self.cond_stage_trainable:
-            print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
+            print(f"{self.__class__.__name__}: Also optimizing conditioner params")
             params = params + list(self.cond_stage_model.parameters())
         if self.learn_logvar:
             print('Diffusion model optimizing logvar')
             params.append(self.logvar)
-
         if self.cc_projection is not None:
-            params = params + list(self.cc_projection.parameters())
             print('========== optimizing for cc projection weight ==========')
-
-        opt = torch.optim.AdamW([{"params": self.model.parameters(), "lr": lr},
-                                {"params": self.cc_projection.parameters(), "lr": 10. * lr}], lr=lr)
+            params = params + list(self.cc_projection.parameters())
+        
+        # Count parameters
+        n_params = sum(p.numel() for p in params)
+        print(f"Total trainable parameters: {n_params:,}")
+        
+        opt = None
+        
+        try:
+            import bitsandbytes as bnb
+            opt = bnb.optim.AdamW8bit(params, lr=lr)
+            print(">>> Using 8-bit AdamW optimizer (memory efficient) <<<")
+        except Exception as e:
+            print(f"bitsandbytes failed: {type(e).__name__}: {e}")
+        
+        if opt is None:
+            try:
+                from transformers.optimization import Adafactor
+                opt = Adafactor(
+                    params,
+                    lr=lr,
+                    scale_parameter=False,
+                    relative_step=False,
+                    warmup_init=False
+                )
+                print(">>> Using Adafactor optimizer (no momentum) <<<")
+            except Exception as e:
+                print(f"Adafactor failed: {type(e).__name__}: {e}")
+        
+        # Option 3: SGD with momentum (guaranteed to work, uses least memory)
+        if opt is None:
+            print(">>> Using SGD with momentum (lowest memory, may need more epochs) <<<")
+            opt = torch.optim.SGD(params, lr=lr * 10, momentum=0.9)  # SGD needs higher LR
+        
         if self.use_scheduler:
             assert 'target' in self.scheduler_config
             scheduler = instantiate_from_config(self.scheduler_config)
