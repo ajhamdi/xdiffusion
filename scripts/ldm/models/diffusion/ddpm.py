@@ -205,7 +205,7 @@ class DDPM(pl.LightningModule):
 
     @torch.no_grad()
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
-        sd = torch.load(path, map_location="cpu", weights_only=False)  # weights_only=False for PyTorch 2.6+
+        sd = torch.load(path, map_location="cpu") # , weights_only=False)  # weights_only=False for PyTorch 2.6+
         if "state_dict" in list(sd.keys()):
             sd = sd["state_dict"]
         keys = list(sd.keys())
