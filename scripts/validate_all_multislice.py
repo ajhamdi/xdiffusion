@@ -120,14 +120,20 @@ def load_model(config_path, ckpt_path, device):
     print(f"Loading config from {config_path}")
     config = OmegaConf.load(config_path)
     
+    # Override config's ckpt_path with command-line argument
     print(f"Loading checkpoint from {ckpt_path}")
+    if "ckpt_path" in config.model.params:
+        config.model.params.ckpt_path = ckpt_path
+    
     model = instantiate_from_config(config.model)
     
-    sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if "state_dict" in sd:
-        sd = sd["state_dict"]
+    # If ckpt_path wasn't in config, load weights manually
+    if "ckpt_path" not in config.model.params:
+        sd = torch.load(ckpt_path, map_location="cpu") # , weights_only=False)
+        if "state_dict" in sd:
+            sd = sd["state_dict"]
+        model.load_state_dict(sd, strict=False)
     
-    model.load_state_dict(sd, strict=False)
     model = model.to(device)
     model.eval()
     
