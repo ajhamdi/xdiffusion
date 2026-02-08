@@ -2,6 +2,9 @@
 [![ArXiv](https://img.shields.io/badge/ArXiv-Paper-<COLOR>.svg)](https://arxiv.org/abs/2404.19604)
 [![ProjectPage](https://img.shields.io/badge/Project_Page-blue)](https://emmanuelleb985.github.io/XDiffusion/)
 
+
+[[Pre-trained 3-slice input]][https://www.dropbox.com/scl/fi/x0uspjil2yvi0nzt91ovj/xdiffusion_3slices_last.ckpt?rlkey=1jqnc28squdzpo7tmwk8x73sc&st=3hw26kz9&dl=0]
+
 ##  Usage
 ```
 conda create -n XDiffusion python=3.9
@@ -80,3 +83,6 @@ This repository is based on [Zero-123](https://github.com/cvlab-columbia/zero123
       primaryClass={eess.IV}
 }
 ```
+
+
+[https://www.dropbox.com/scl/fi/x0uspjil2yvi0nzt91ovj/xdiffusion_3slices_last.ckpt?rlkey=1jqnc28squdzpo7tmwk8x73sc&st=3hw26kz9&dl=0]: https://www.dropbox.com/scl/fi/x0uspjil2yvi0nzt91ovj/xdiffusion_3slices_last.ckpt?rlkey=1jqnc28squdzpo7tmwk8x73sc&st=3hw26kz9&dl=0

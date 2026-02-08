@@ -481,7 +481,7 @@ def compute_volume_psnr(pred_volume, target_volume, data_range=1.0):
 
 
 def aggregate_results(patient_slices, patient_slice_metrics, apply_postprocessing=True,
-                      save_volumes=False, output_dir=None, image_size=256):
+                      light_postprocessing=False, save_volumes=False, output_dir=None, image_size=256):
     """Aggregate per-patient results including 3D volumetric PSNR
     
     Args:
@@ -514,13 +514,16 @@ def aggregate_results(patient_slices, patient_slice_metrics, apply_postprocessin
         
         # Apply post-processing and compute final PSNR
         if apply_postprocessing:
-            pred_volume_final = post_process_volume(
-                pred_volume_raw,
-                z_smooth_sigma=1.2,
-                spatial_smooth_sigma=0.8,
-                enhance_contrast=True,
-                denoise_strength=0.5
-            )
+            if light_postprocessing:
+                pred_volume_final = post_process_volume_light(pred_volume_raw)
+            else:
+                pred_volume_final = post_process_volume(
+                    pred_volume_raw,
+                    z_smooth_sigma=1.2,
+                    spatial_smooth_sigma=0.8,
+                    enhance_contrast=True,
+                    denoise_strength=0.5
+                )
         else:
             pred_volume_final = pred_volume_raw
         
@@ -596,6 +599,8 @@ def main():
     parser.add_argument("--save_volumes", action="store_true", 
                         help="Save input/output/target PNGs, montages, and comparison GIFs")
     parser.add_argument("--image_size", type=int, default=256, help="Image size for GIF frames")
+    parser.add_argument("--no_post_process", action="store_true",
+                        help="Use light post-processing (z-axis smoothing only) instead of full post-processing")
     
     args = parser.parse_args()
     
@@ -639,6 +644,7 @@ def main():
         patient_slices, 
         patient_slice_metrics,
         apply_postprocessing=True,
+        light_postprocessing=args.no_post_process,
         save_volumes=args.save_volumes,
         output_dir=args.output_dir,
         image_size=args.image_size
